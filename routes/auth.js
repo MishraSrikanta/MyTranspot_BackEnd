@@ -36,6 +36,7 @@ const router = express.Router();
  * the open internet: a signup that honoured a role field would mean anyone
  * could ask to be created as somebody else's owner.
  */
+
 router.post(
   "/register",
   handler(async (req, res) => {

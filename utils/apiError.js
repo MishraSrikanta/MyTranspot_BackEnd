@@ -115,6 +115,8 @@ const errors = {
     new ApiError(413, "PAYLOAD_TOO_LARGE", message, details),
   rateLimited: (message = "Too many requests. Please slow down.") =>
     new ApiError(429, "RATE_LIMITED", message),
+  serviceUnavailable: (message = "This service is not configured.") =>
+    new ApiError(503, "SERVICE_UNAVAILABLE", message),
 
   /* ================= transport ================= */
   tripNotFound: () =>

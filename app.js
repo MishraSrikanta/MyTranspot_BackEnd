@@ -235,31 +235,26 @@ app.use("/api/v1/sync", clinicSyncRoutes);
 app.use("/api/v1/backup", clinicBackupRoutes);
 
 /*
- * Provisioning, mounted only when there is a secret to guard it with.
+ * Keep the admin surface mounted in every deployment so a missing secret is
+ * reported as configuration failure rather than as a misleading route 404.
+ * Both routers still require ADMIN_SECRET through their middleware before any
+ * admin operation can run.
  *
- * Not merely hidden: a deployment without ADMIN_SECRET does not have these
- * routes at all, and the 404 an unknown path already produces is the honest
- * answer. An admin API that opens itself when a variable is missing is an admin
- * API that is wide open on the first deployment where somebody forgets one.
+ * Mounted alongside, not instead. The two routers share the prefix and split
+ * cleanly by path — this one owns /tenants and /accounts, provisioning owns
+ * /clinics — so neither has to know the other exists.
+ *
+ * **The order matters, and not for the usual reason.** A router's `router.use`
+ * runs for every request that reaches the mount prefix, matched route or not,
+ * and the clinic router's chain opens with `adminRateLimit`: twenty requests
+ * per fifteen minutes, sized for provisioning a clinic, not for a console that
+ * lists every tenant the moment it loads. Mounted second, this router's
+ * traffic spent that budget on its way past, and the operator was locked out
+ * of a screen they had only just opened. First, its own paths are answered
+ * before the clinic chain is entered at all.
  */
-if (process.env.ADMIN_SECRET) {
-  /*
-   * Mounted alongside, not instead. The two routers share the prefix and split
-   * cleanly by path — this one owns /tenants and /accounts, provisioning owns
-   * /clinics — so neither has to know the other exists.
-   *
-   * **The order matters, and not for the usual reason.** A router's `router.use`
-   * runs for every request that reaches the mount prefix, matched route or not,
-   * and the clinic router's chain opens with `adminRateLimit`: twenty requests
-   * per fifteen minutes, sized for provisioning a clinic, not for a console that
-   * lists every tenant the moment it loads. Mounted second, this router's
-   * traffic spent that budget on its way past, and the operator was locked out
-   * of a screen they had only just opened. First, its own paths are answered
-   * before the clinic chain is entered at all.
-   */
-  app.use("/api/v1/admin", adminAccountRoutes);
-  app.use("/api/v1/admin", clinicAdminRoutes);
-}
+app.use("/api/v1/admin", adminAccountRoutes);
+app.use("/api/v1/admin", clinicAdminRoutes);
 
 /*
  * The scheduled sweep that closes past days.

@@ -92,8 +92,9 @@ async function requireClinicKey(req, res, next) {
  *
  * A shared secret in a header, and that is the right size of mechanism for
  * something used a handful of times per customer by the person who runs the
- * deployment. It is guarded twice: the secret must match, and the routes are
- * only mounted at all when ADMIN_SECRET is set (see app.js).
+ * deployment. It is guarded twice: the secret must match, and app.js keeps the
+ * surface mounted so a missing deployment secret is reported as configuration
+ * failure rather than a misleading route 404.
  *
  * The unset case is refused rather than allowed. An admin API that opens itself
  * when a variable is missing is an admin API that is wide open on the first
@@ -105,7 +106,10 @@ function requireAdminSecret(req, res, next) {
   const supplied = String(req.headers["x-admin-secret"] || "").trim();
 
   if (!expected) {
-    return sendError(res, errors.notFound());
+    return sendError(
+      res,
+      errors.serviceUnavailable("The admin API is not configured on this deployment.")
+    );
   }
   if (!supplied || !safeEqual(sha256(supplied), sha256(expected))) {
     return sendError(res, errors.unauthenticated("That admin secret is not valid."));

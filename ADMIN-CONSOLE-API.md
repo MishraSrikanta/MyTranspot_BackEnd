@@ -34,14 +34,12 @@ x-admin-secret: <ADMIN_SECRET>
 The caller is not a person with an account, it is a console — there is no
 session to have, so there is no session to check.
 
-Guarded twice over, the same way the clinic provisioning routes are:
+The router is mounted in every deployment so missing configuration is visible as
+a **503** rather than a misleading route **404**. `requireAdminSecret` rejects a
+wrong or missing request secret with **401** when `ADMIN_SECRET` is configured.
 
-1. `requireAdminSecret` rejects a wrong or missing secret with **401**.
-2. **`app.js` does not mount the router at all unless `ADMIN_SECRET` is set.** A
-   deployment that was never given one does not have these endpoints to find.
-
-> **`ADMIN_SECRET` is not currently set in `.env`,** so these routes are absent
-> from the local deployment. Set it before pointing a console at it.
+> Set `ADMIN_SECRET` in the deployment before pointing a console at it. Without
+> it, the routes remain visible but return `SERVICE_UNAVAILABLE`.
 
 Rate limited by `consoleRateLimit` — **300 requests per 15 minutes per IP**, and
 deliberately *not* the provisioning limiter (`adminRateLimit`, 20/15min), which

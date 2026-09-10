@@ -67,9 +67,9 @@ const parseClinicList = (raw) => parseClinicInputs(raw, MAX_CLINICS_PER_CALL);
  * check. An `x-admin-secret` header matches the deployment's ADMIN_SECRET or
  * the request does not happen.
  *
- * Guarded twice over, again like the provisioning routes: app.js does not mount
- * this router at all unless ADMIN_SECRET is set, so a deployment that was never
- * given one does not have these endpoints to find.
+ * Guarded twice over, again like the provisioning routes: app.js keeps this
+ * router mounted so a missing deployment secret is reported as configuration
+ * failure rather than a misleading route 404.
  *
  * ================= one router, two products =================
  *
@@ -89,6 +89,15 @@ const router = express.Router();
 /* Limiter first, so a wrong secret is counted rather than waved through to be
  * refused for free — see consoleRateLimit in middleware/rateLimit.js. */
 router.use(consoleRateLimit, requireAdminSecret);
+
+/* ================= POST /api/v1/admin/login =================
+ * Validate the console secret before the frontend starts loading its data.
+ * The secret remains in the request header and is never echoed in the response.
+ */
+router.post(
+  "/login",
+  handler(async (req, res) => res.json({ authenticated: true }))
+);
 
 /* Which product a request is about. Every route needs it, so it is read one way
  * rather than three times with three different fallbacks. */

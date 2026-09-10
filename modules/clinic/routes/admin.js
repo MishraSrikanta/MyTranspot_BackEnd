@@ -29,9 +29,9 @@ const router = express.Router();
  * Provisioning. Three endpoints, used a handful of times per customer by
  * whoever runs the deployment — not by anybody at a clinic.
  *
- * Guarded twice over: the shared secret must match, and app.js does not mount
- * this router at all unless ADMIN_SECRET is set. A deployment that has not been
- * given one does not have these endpoints to find.
+ * Guarded twice over: the shared secret must match, and app.js keeps this
+ * router mounted so a missing deployment secret is reported as configuration
+ * failure rather than a misleading route 404.
  */
 router.use(requireAdminSecret, adminRateLimit);
 

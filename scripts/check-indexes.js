@@ -1,86 +1,91 @@
 require("dotenv").config();
 
 const mongoose = require("mongoose");
+const { connectToDatabase } = require("../db");
 
-/* Requiring the models is what registers their schemas — and therefore their
- * index definitions — with Mongoose. Nothing else in this file uses them. */
-require("../models/Company");
+/*
+ * Build every index both modules declare, and say what happened.
+ *
+ * Mongoose creates indexes in the background on first use by default, which is
+ * fine in development and is not a plan for production: the first slow morning
+ * is the wrong moment to discover that the delta feed has been doing a
+ * collection scan since launch. Running this at deploy time makes index
+ * creation a step somebody watches rather than a side effect nobody sees.
+ *
+ *   node scripts/check-indexes.js
+ */
+
+/* Shared. */
 require("../models/Account");
-require("../models/Customer");
-require("../models/Driver");
-require("../models/Vehicle");
-require("../models/Trip");
-require("../models/TripExpense");
-require("../models/LocationPing");
-require("../models/VehicleState");
-require("../models/Estimate");
-require("../models/Payment");
 require("../models/AuditLog");
 require("../models/Counter");
 
-/*
- * Build every index the models declare, then print what the database actually
- * has.
- *
- * Mongoose creates indexes in the background on connect by default, which is
- * fine in development and is not something to rely on in production: index
- * creation on a collection with millions of location pings is a job that should
- * be run deliberately, watched, and known to have finished — not something that
- * happens silently while the first request of the morning waits on it.
- *
- *   node scripts/check-indexes.js
- *
- * The output is worth reading rather than skimming. The two indexes that decide
- * whether this product stays fast are on LocationPing — (tripId, recordedAt)
- * for replay and (vehicleId, recordedAt) unique for the offline-batch dedupe —
- * and the compound companyId indexes on Trip, which every report depends on.
- */
+/* Transport. */
+require("../modules/transport/models/Company");
+require("../modules/transport/models/Customer");
+require("../modules/transport/models/Driver");
+require("../modules/transport/models/Employee");
+require("../modules/transport/models/Vehicle");
+require("../modules/transport/models/VehicleState");
+require("../modules/transport/models/Trip");
+require("../modules/transport/models/TripExpense");
+require("../modules/transport/models/LocationPing");
+require("../modules/transport/models/Estimate");
+require("../modules/transport/models/Payment");
+
+/* Clinic. */
+require("../modules/clinic/models/Owner");
+require("../modules/clinic/models/Clinic");
+require("../modules/clinic/models/ClinicLicense");
+require("../modules/clinic/models/Slot");
+require("../modules/clinic/models/CloudConnection");
 
 async function main() {
-  await mongoose.connect(process.env.MONGO_URI);
-  console.log(`connected to ${mongoose.connection.name}\n`);
+  await connectToDatabase();
+  console.log("[check-indexes] connected\n");
 
-  const models = mongoose.modelNames().sort();
+  const names = mongoose.modelNames().sort();
 
-  for (const name of models) {
+  for (const name of names) {
     const model = mongoose.model(name);
-    process.stdout.write(`${name}: building... `);
     try {
       await model.createIndexes();
-      console.log("ok");
+      const indexes = await model.collection.indexes();
+      console.log(`${name} (${model.collection.collectionName})`);
+      for (const index of indexes) {
+        const keys = Object.entries(index.key)
+          .map(([k, v]) => `${k}:${v}`)
+          .join(", ");
+        const flags = [
+          index.unique ? "unique" : null,
+          index.sparse ? "sparse" : null,
+          index.expireAfterSeconds !== undefined ? `ttl ${index.expireAfterSeconds}s` : null,
+        ]
+          .filter(Boolean)
+          .join(" ");
+        console.log(`  { ${keys} }${flags ? `  ${flags}` : ""}`);
+      }
+      console.log("");
     } catch (err) {
       /*
-       * The usual cause is real data that violates a unique index being added
-       * after the fact — two vehicles sharing a plate, say. It is reported and
-       * the run continues, because the other collections' indexes are still
-       * worth building and stopping here would hide them.
+       * Reported rather than thrown, and the run continues.
+       *
+       * The usual cause is a unique index that cannot be built because the data
+       * already violates it — two clinics on one slug, a duplicate slot for a
+       * doctor. That is exactly the thing worth knowing about, and stopping at
+       * the first one would hide the rest.
        */
-      console.log(`FAILED: ${err.message}`);
-      continue;
+      console.error(`${name}: ${err.message}\n`);
+      process.exitCode = 1;
     }
-
-    const indexes = await model.collection.indexes();
-    const count = await model.collection.estimatedDocumentCount();
-    console.log(`  documents: ~${count}`);
-    for (const idx of indexes) {
-      const keys = Object.entries(idx.key)
-        .map(([k, v]) => `${k}:${v}`)
-        .join(", ");
-      const flags = [
-        idx.unique ? "unique" : null,
-        idx.sparse ? "sparse" : null,
-        idx.partialFilterExpression ? "partial" : null,
-      ].filter(Boolean);
-      console.log(`  - ${idx.name}  {${keys}}${flags.length ? `  [${flags.join(", ")}]` : ""}`);
-    }
-    console.log("");
   }
-
-  await mongoose.disconnect();
 }
 
-main().catch(async (err) => {
-  console.error(err);
-  await mongoose.disconnect().catch(() => {});
-  process.exit(1);
-});
+main()
+  .catch((err) => {
+    console.error("[check-indexes] failed:", err.message);
+    process.exitCode = 1;
+  })
+  .finally(async () => {
+    await mongoose.connection.close().catch(() => {});
+  });

@@ -6,22 +6,37 @@ const AuditLog = require("../models/AuditLog");
  * Two rules, both learned the hard way in systems like this:
  *
  * 1. Auditing never fails the action. If the log write throws — a replica
- *    stepping down, a disk full — the expense approval it was recording has
- *    already happened, and turning that into a 500 would leave the client
- *    retrying an approval that already went through. The failure is logged to
- *    the console and swallowed.
+ *    stepping down, a disk full — the invoice it was recording has already been
+ *    cancelled, and turning that into a 500 would leave the client retrying a
+ *    cancellation that already went through. The failure is logged to the
+ *    console and swallowed.
  *
  * 2. It is fire-and-forget from the caller's point of view. The route does not
  *    await it, so an audit write never sits between the user and their
  *    response.
+ *
+ * The signature is the same for both modules. Which tenant field a row lands in
+ * is worked out here from the account, so no route has to know whether it is
+ * running inside a haulage company or a clinic group.
  */
 
-function record(req, { action, entityType, entityId, entityLabel, changes, note }) {
+function record(req, { action, entityType, entityId, entityLabel, changes, note, clinicId }) {
   const account = req.account;
   if (!account) return;
 
+  const module = account.module || "transport";
+
   AuditLog.create({
-    companyId: account.companyId,
+    module,
+    /* companyId for transport, ownerId for clinic — the account knows which. */
+    tenantId: module === "clinic" ? account.ownerId : account.companyId,
+    /*
+     * The clinic the action happened in. Taken from the caller when given —
+     * an owner acting on one branch while scoped to All Clinics — and otherwise
+     * from the account, which is the right answer for a clinic login and null
+     * for everyone else.
+     */
+    clinicId: clinicId || account.clinicId || null,
     action,
     entityType,
     entityId: entityId || null,

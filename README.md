@@ -1,356 +1,355 @@
-# MyTransport — Backend
+# Backend — MyTransport + MyClinic
 
-A cloud transportation management and profitability API: trips, vehicles,
-drivers, expenses, estimates and live vehicle tracking, with the actual
-profitability of every trip.
+One Node/Express + MongoDB deployment serving two products as submodules.
 
-Built to the same conventions as the FinanceGPT backend it was modelled on —
-CommonJS, Express 5, Mongoose, JWT bearer auth, and one error envelope for the
-whole API.
+```
+backend/
+  app.js  server.js  db.js  api/index.js
+  routes/       auth.js · users.js (dispatcher)
+  utils/        apiError · validate · auth · audit · permissions
+  middleware/   auth · clinicScope · clinicKey · syncAuth · rateLimit
+  models/       Account · AuditLog · Counter          ← shared
+  modules/
+    transport/  models/ routes/ utils/ scripts/ permissions.js
+    clinic/     models/ routes/ utils/          permissions.js
+  scripts/      check-indexes · migrate-counters
+```
+
+The two products share the error envelope, the validators, the rate limiter,
+the account table and the database connection. `app.js` is the only file that
+knows both exist — plus `routes/users.js`, which exists because `/users` is the
+one path both products own.
 
 ---
 
-## The one architectural idea
+## MyClinic is a hybrid, and the split is the whole design
 
-**The trip is the spine. GPS is one of its attributes.**
+| Domain | Owner | Where the app reads it |
+|---|---|---|
+| Accounts, sessions, staff, permissions | **Server** | `/auth/*`, `/users` |
+| Slots **and the bookings inside them** | **Server** | `/slots`, `/tokens` |
+| Clinic profile, doctors, services (public subset) | **Excel**, published up | `/sync/profile` |
+| Patients, doctors, services, tests, reports, invoices, payments, expenses | **Excel** | local, never the server |
 
-A trip has a customer, a price, an expense ledger and a profit whether or not a
-single phone ever reports a position. Live tracking *attaches to* a trip; it is
-not the thing trips live inside. That is what keeps the business usable on the
-day a driver's handset is flat, and it is why location history is a separate
-collection referenced from the trip rather than the other way round.
+Slots and their bookings became cloud-only in v4. Nothing about who is booked
+when is written to the workbook, read from it, or reconciled against it — which
+is why `POST /sync/slots`, `GET /sync/bookings` and the acknowledgement
+endpoint are **gone** rather than deprecated. There is nothing to publish and
+nothing to pull, because the slot was never local.
 
+The reason is the one that matters: a patient books online at midnight, so a
+booking that exists only on one reception PC is not a booking. Whoever opens the
+console next morning — another machine, a phone, the owner from another branch —
+has to see the same day.
+
+### The booking lives inside the slot
+
+There is no Appointment collection, and no Token one. A slot is one document
+carrying its capacity, its bookings, and a snapshot of the clinic and doctor it
+belongs to.
+
+Every question this product asks is *"what is free, and who is in the rest?"* —
+a booking page, a reception grid, a token queue. With separate documents that is
+a join on every render and a race on every booking. With the bookings inside the
+slot it is one read, and taking the last place is one atomic update of one
+document.
+
+The snapshots are copies rather than references because they have to be: the
+server has no access to the workbook and never will, so the only way a public
+booking page can render a doctor's name is if it was written there when the slot
+was created. It also gives the right behaviour when a clinic renames itself —
+slots already created keep the old name, and a patient holding a confirmation
+sees the name that was on it.
+
+### What the clinic server still never stores
+
+A booking holds a name and a mobile number, optionally a service name and a
+note. No address, no date of birth, no diagnoses, no results, no billing, no
+history. `patientId` is an opaque string from the clinic's own workbook that
+this server stores and never resolves.
+
+A patient booking online is not registering as a patient. Reception searches its
+**own** workbook for that mobile number afterwards, links the booking to an
+existing record or registers a new one locally, and bills and reports against
+that. Which is why the server holds so little.
+
+If this server is breached, what leaks is a list of appointment times — not a
+medical record. That ceiling is a design property and the one thing here that
+cannot be undone by a later release, because the data would already have been
+collected.
+
+### And it is working memory, not a record
+
+Each slot carries an `expiresAt`: the end of its own day in the clinic's
+timezone plus the practice's retention window, 48 hours by default. A MongoDB
+TTL index removes the document and the bookings inside it go with it.
+
+**Forty-eight hours is not a lot, and anything the clinic needs to keep must be
+out before then.** What survives is whatever they wrote into their own workbook —
+an invoice, a report, a patient record. The slot and its bookings are working
+memory.
+
+---
+
+## Endpoints
+
+### Auth
+
+| Method | Path | Auth |
+|---|---|---|
+| GET | `/health` | none |
+| GET | `/api/v1/auth/modules` | none |
+| POST | `/api/v1/auth/register` | developer code (clinic only) |
+| POST | `/api/v1/auth/login` | none — email **or** login ID, 12-hour JWT |
+| POST | `/api/v1/auth/driver-login` | none — transport handsets, 90-day token |
+| GET | `/api/v1/auth/me` | Bearer |
+| POST | `/api/v1/auth/change-password` | Bearer |
+
+`register`, `login` and `me` all return the same clinic session:
+`{ module, account, owner, clinics }`.
+
+### Clinic — the console
+
+| Method | Path | Permission |
+|---|---|---|
+| POST | `/api/v1/slots` | `slots.manage` + single clinic — expands a pattern |
+| GET | `/api/v1/slots` | `slots.view` — all doctors unless `doctorId` is given |
+| PATCH | `/api/v1/slots/:id` | `slots.manage` — block, unblock, capacity |
+| DELETE | `/api/v1/slots/:id` | `slots.manage` — 409 with live bookings |
+| DELETE | `/api/v1/slots?before=` | `appointments.purge` (owner) — bulk |
+| POST | `/api/v1/slots/:id/book` | `appointments.manage` |
+| POST | `/api/v1/slots/:id/bookings/:ref/cancel` | `appointments.cancel` |
+| GET | `/api/v1/tokens/queue` | `tokens.view` |
+| POST | `/api/v1/tokens/issue` · `/call-next` · `/:slotId/:ref/:action` | `tokens.manage` |
+| GET · POST · PATCH | `/api/v1/users` | `users.manage` (owner) |
+| GET | `/api/v1/users/permissions` | any session |
+| GET · DELETE | `/api/v1/cloud/google/{connect,callback,status,disconnect}` | Bearer (callback: signed state) |
+| POST · GET | `/api/v1/cloud/file/{upload,download,versions}` | Bearer |
+
+### Clinic — public
+
+| Method | Path |
+|---|---|
+| GET | `/api/v1/public/clinics` — the booking directory |
+| GET | `/api/v1/public/clinics/:slug` |
+| GET | `/api/v1/public/clinics/:slug/slots` — free slots only, no bookings |
+| POST | `/api/v1/public/clinics/:slug/slots/:slotId/book` |
+| GET · POST | `/api/v1/public/bookings/:publicRef[/cancel]` |
+
+### Clinic — sync, admin, backup
+
+`PUT /sync/profile` and `GET /sync/status` remain: the workbook still owns the
+clinic's name, hours, doctors and services, and this server keeps a read-only
+mirror for the public page. `/sync/profile` accepts **either** `X-Clinic-Key`
+**or** a Bearer session.
+
+The three `/admin/clinics` routes and `/backup/*` are unchanged.
+
+**Dropped in v4:** `POST /sync/slots`, `GET /sync/bookings`,
+`POST /sync/bookings/ack`, and the whole `/appointments` router.
+
+### Cron
+
+`POST|GET /api/cron/retention`, hourly, behind `CRON_SECRET`. There is no
+`close-past` any more: a v4 slot has no lifecycle status to advance, and the
+deletion happens on its own through the TTL index — this job makes it prompt and,
+more importantly, makes it *countable*.
+
+### Transport
+
+Unchanged: `/api/v1/{me,company,customers,vehicles,drivers,employees,trips,expenses,estimates,tracking,payments,reports,dashboard}` and `/users`.
+
+---
+
+## Nine things worth understanding before changing this code
+
+**1. Taking a place is one atomic conditional update.** Both the public path and
+reception's go through `claimPlace` in `modules/clinic/routes/slots.js`:
+
+```js
+findOneAndUpdate(
+  { _id, clinicId, isBlocked: false, available: { $gt: 0 }, date: { $gte: todayInClinicTZ } },
+  { $inc: { booked: 1, available: -1 }, $push: { bookings: {...} } }
+)
 ```
-Trip
-├── Revenue          what the customer pays, itemised
-├── Estimate         what it was budgeted to cost   (frozen when it starts)
-├── Expenses         what it actually cost          (separate collection)
-├── Vehicle / Driver / Customer
-├── Planned route    + every superseded version
-├── Location history (separate collection)
-└── Profit           revenue − approved cost
-```
 
-## Multi-tenancy
+The filter **is** the concurrency control. Two patients tapping the last 10:15
+at the same moment is not a rare case — it is what happens when a clinic posts
+its link to a WhatsApp group. Covered by concurrency tests on both paths.
 
-Every document carries a `companyId`. Every query is scoped by it. That id is
-read **from the authenticated account** — never from a header, a path segment or
-a body field. There is no value a client can send that changes which company's
-data it reads.
+A `null` result means blocked, full, past or gone. The public route does not try
+to tell them apart: every branch ends in "choose another time", and
+distinguishing them on an unauthenticated endpoint would tell a stranger which
+of a clinic's times are full.
 
-Trip numbers are per company, so two tenants can both hold `TRP-000102`.
+**2. `available` is stored, not computed.** It is written in the same update as
+the booking. Computing it per request means two readers can both see "1 free",
+and storing it is what lets the filter above be an indexed comparison.
+
+**3. Giving a place back is the same update in reverse.** `releasePlace` sets
+the status and increments availability together, with `arrayFilters` matching
+only a live booking — which is what makes a second cancellation match nothing
+rather than pushing `available` above `capacity`. A cancellation that does not
+free the place is a slot the clinic cannot resell, and they will not notice
+until the day.
+
+**4. `ref` is sequential; `publicRef` is the credential.** The patient's
+cancellation link is addressed by 128 bits of randomness, never by
+`APT-2026-004411`. Cancelling ...410, then ...411, then ...412 would otherwise
+empty a clinic's whole day from a browser. `publicRef` is returned exactly once,
+to the person who made the booking, and never appears in a console list.
+
+**5. Re-publishing a fortnight is the normal case.** `POST /slots` is idempotent
+on `(clinicId, doctor.id, date, startTime)` and existing rows are left exactly
+as they are — capacity, bookings and all. A republish that reset `available`
+would hand out places already taken.
+
+**6. An owner's empty `clinicIds` means ALL clinics, not none.** Reading it the
+other way locks an owner out of their own practice with an empty screen and no
+error to explain it.
+
+**7. A clinic outside your scope is 404, never 403.** A 403 confirms the id is
+real, which is how one practice enumerates another's. The frontend also treats
+401 as session-over, so a wrong clinic must never be a 401 either.
+`CLINIC_REQUIRED` is likewise a contract rather than a failure: the frontend
+renders an inline clinic picker on it and resubmits.
+
+**8. Time is checked at read, in the clinic's own timezone.**
+`new Date().toISOString().slice(0,10)` is UTC's today, which rolls over at 05:30
+in India — using it would expire a clinic's whole morning while patients were
+arriving. Everything goes through `modules/clinic/utils/clinicTime.js`. The TTL
+index tidies expired slots about once a minute and is explicitly not a
+guarantee; the read-time filter is what keeps the answers right in between.
+
+**9. One product's token must not reach the other's routes.** Every transport
+router is mounted behind `assertTokenModule("transport")`, and it is not
+belt-and-braces — it closes a real leak. A clinic account passed transport's
+`requireAuth` (a valid account), passed `requirePermission` (a clinic OWNER
+short-circuits every permission check by design), and then queried
+`{ companyId: req.companyId }` with `req.companyId` undefined — which Mongoose
+**strips** from a filter rather than matching nothing. Three individually
+reasonable behaviours composing into an unscoped, cross-tenant query.
+
+---
+
+## Public responses are allowlists, never spreads
+
+`modules/clinic/utils/serialise.js` builds every public shape field by field.
+`{ ...doctor }` minus a couple of keys publishes a personal mobile and a
+registration number the day somebody adds a field, on a page Google indexes
+within hours.
+
+A slot document carries the clinic's capacity, its other patients' names and
+their telephone numbers. The patient gets a time, a doctor, and one number:
+`available`. The console's booking shape omits `publicRef`, which is the
+patient's own credential — a diary list carrying it would put every patient's
+cancellation link into the browser of anybody who can open the grid.
+
+---
+
+## Signing up
+
+`POST /auth/register` takes `module` first, because the rest of the form differs.
+
+`module: "transport"` creates a Company and its owner.
+
+`module: "clinic"` requires `developerCode` and creates a practice, its clinics,
+the owner account, and one API key per clinic — the keys shown once and never
+again.
+
+- **`clinics` is optional.** A list of names, capped at ten, blanks dropped and
+  duplicates removed case-insensitively. Over the cap is refused, not truncated.
+- **`code`, `slug` and `loginId` are generated, never accepted.** The code
+  prefixes login IDs and numbered documents, so a chosen one lets two practices
+  collide their sequences; a chosen slug is a way to squat on a competitor's
+  public address. Collisions get a suffix — `SUN2`, `sunshine-diagnostics-2`.
+- **`role` in the body is ignored entirely.** Signup creates an owner of a *new*
+  practice; what must never be possible is joining an existing one.
+- **No catalogue is seeded.** This reverses v2: a seeded price is a price nobody
+  at that clinic agreed to, sitting somewhere an invoice can be raised from.
+
+Sign-in takes **either an email or a login ID in the same field**, because users
+do not reliably know which they hold. The minimum password is **3 characters** —
+deliberate: this login is shared at a reception desk, and forcing `Xk9$mQ2!`
+onto that desk produces a sticky note on the monitor. The rate limiter is what
+actually stops guessing.
+
+---
+
+## Google Drive
+
+The customer pastes nothing. They press Connect, approve Google's consent
+screen, and the backend creates the folder and the file on first upload and
+stores both ids.
+
+Storing them is not an optimisation. The `drive.file` scope grants access only
+to files this app created, which is the right scope — full `drive` triggers a
+Google security review nobody needs — and it means the app **cannot search the
+user's Drive for the workbook by name**. After a reinstall those ids are the
+only route back to the file.
+
+The callback carries no bearer token, because Google issues it. The session
+travels in the OAuth `state` parameter, **signed** and expiring in ten minutes:
+a raw account id there would be an account-takeover hole, since anyone could
+complete a consent flow with somebody else's id in it.
+
+The refresh token is stored **encrypted** (AES-256-GCM under
+`CLOUD_ENCRYPTION_KEY`) and is never returned by any endpoint. A Google refresh
+token does not expire, so a plain-text leak is a standing key to every connected
+practice's patient history. Disconnect revokes it at Google *and* deletes the
+row; dropping the row alone leaves a live grant the customer can see and this
+product cannot.
+
+Google Cloud Console, once: create a project → enable the Drive API → consent
+screen → add **only** `.../auth/drive.file` → create a Web application client →
+add your origin to **Authorized JavaScript origins** → add the callback to
+**Authorized redirect URIs** character for character, no trailing slash. A
+mismatch there is `redirect_uri_mismatch`, the single most common failure in
+this flow. Add yourself as a test user while the screen is unverified, or Google
+returns `access_blocked` with no useful detail.
 
 ---
 
 ## Running it
 
 ```bash
-cd backend
 npm install
-cp .env.example .env        # then fill in MONGO_URI and JWT_SECRET
-npm run dev                 # or: npm start
+cp .env.example .env        # MONGO_URI and JWT_SECRET at minimum
+npm run dev
+npm run check-indexes       # build every declared index and report
+npm run seed                # transport demo data
 ```
 
-The server refuses to start without `MONGO_URI` and `JWT_SECRET`, because a
-missing secret otherwise looks like a broken login rather than a missing
-variable.
+`server.js` is the local entry point and `api/index.js` the serverless one; both
+import the same `app.js`. A missing environment variable should stop a process
+from starting, and should *not* take down a serverless request that could have
+returned a readable error.
 
-| Variable | Purpose |
-|---|---|
-| `MONGO_URI` | MongoDB connection string |
-| `JWT_SECRET` | Token signing key — long and random |
-| `PORT` | Defaults to `5100` |
-| `CORS_ORIGINS` | Comma-separated allowlist. `*` for local development only |
+Run `check-indexes` at deploy time rather than relying on Mongoose's background
+creation. It has now caught two indexes that were silently failing to build: a
+`Driver` index specifying both `sparse` and `partialFilterExpression`, and a
+`ClinicLicense` index declared twice so its `unique` option was dropped. In both
+cases the constraint the model appeared to promise did not exist.
 
-### Scripts
+### Upgrading an existing deployment
 
 ```bash
-npm run seed             # demo company: owner + 3 sub-accounts, fleet, trips with a simulated GPS track
-npm run seed -- --reset  # rebuild it
-npm run ensure-owner "ABC Transport" owner@abc.test "Srikanta" secret123
-npm run check-indexes    # build every index and print what the database has
+npm run migrate-counters -- --apply   # Counter.companyId -> tenantId
 ```
 
-Seed logins are all `transport123`: `owner@`, `manager@`, `accountant@`,
-`operations@`, and `rajesh@` (driver app) at `abctransport.test`.
-
----
-
-## Users and permissions
-
-One owner per company plus sub-accounts. The brief's four roles exist as
-**presets**, not as hard-coded behaviour — what is stored on a user is a list of
-permissions, and the role only decides what that list starts as.
-
-That matters because no two transport offices divide the work the same way. One
-owner wants the accountant on the live map; the next does not want the manager
-near driver fees. With presets that is a tick box. With hard-coded roles it is a
-release.
-
-| Role | Starts with |
-|---|---|
-| `owner` | everything, and short-circuits every check — an owner cannot lock themselves out |
-| `manager` | trips, fleet, drivers, day-to-day spend, reports |
-| `accountant` | every rupee, plus expense approval. No dispatching |
-| `operations` | everything operational, **no** `profit.view` |
-| `custom` | starts empty; the owner ticks what is needed |
-
-Read and write are separate throughout (`trips.view` / `trips.manage`), and
-three permissions are deliberately carved out on their own:
-
-- `trips.close` — closing banks the profit and freezes the ledger
-- `expenses.approve` — approving is what moves a claim into the trip cost
-- `tracking.manage` — changing the reporting interval has a data-cost consequence
-
-`GET /api/v1/users/permissions` serves the catalogue, so the frontend builds its
-menu from the server and a new permission appears in the UI without a frontend
-release.
-
----
-
-## Live tracking, and how the 15-minute update actually works
-
-The default reporting interval is **15 minutes**, set per company and
-overridable per vehicle. The owner can change it at any time.
-
-### The flow
-
-1. The driver app samples GPS on the interval — **whether or not it has signal**
-   — and queues each sample locally with the time it was *taken*.
-2. When a connection is available it `POST`s the whole queue to
-   `/api/v1/tracking/pings` and clears it on a `2xx`.
-3. The response carries the **current interval**, so an owner's change in the
-   office reaches every handset on its next upload. No push channel is needed,
-   and it works on a phone that has been out of contact for two days.
-
-This is the answer to "the lorry drove four hours through a valley with no
-network". The alternative — send the current position, drop it if the network is
-down — produces a straight line across Chhattisgarh and a distance total short by
-a hundred kilometres, which is money, because the driver is paid per kilometre.
-
-Three consequences run through the implementation:
-
-- **`recordedAt` is authoritative, `receivedAt` is diagnostic.** Ordering,
-  distance and speed all come from when the fix was taken.
-- **Uploads are idempotent.** A unique index on `(vehicleId, recordedAt)` makes
-  a re-sent batch a no-op, so a phone that lost the reply can simply send again.
-- **A batch is processed in time order as one continuous track**, so distance
-  across the offline gap is measured properly.
-
-### Fixes the server will not count
-
-Stored anyway, with the reason, and left out of the distance:
-
-| Reason | Why |
-|---|---|
-| `POOR_ACCURACY` | a cell-tower guess, over `maxAccuracyM` (default 500 m) |
-| `IMPLAUSIBLE_JUMP` | implied speed over 140 km/h across more than 200 m |
-| `OUT_OF_ORDER` | a late fix older than one already held |
-
-Discarding them silently would make a tracker producing rubbish for a fortnight
-look exactly like a lorry standing still.
-
-### Settings
-
-`PUT /api/v1/company/tracking`
-
-| Field | Default | Notes |
-|---|---|---|
-| `intervalSeconds` | `900` | 10 s – 1 h. The floor is where GPS stops surviving a working day |
-| `idleIntervalSeconds` | = interval | a parked lorry need not report as often |
-| `routeDeviationKm` | `5` | loose on purpose — an alert nobody trusts is worse than none |
-| `maxAccuracyM` | `500` | |
-| `minStopMinutes` | `15` | below this it is a queue, not a stop |
-| `maxOfflineBacklogHours` | `72` | how far back an upload may reach |
-| `offlineAfterMissedIntervals` | `3` | derived, so a shorter interval also greys a lorry out sooner |
-
-Per vehicle: `PUT /api/v1/company/vehicles/:id/tracking`.
-
----
-
-## Routes: planned, changed, and actual
-
-- `PUT /api/v1/trips/:id/route` sets the planned line. The **previous route is
-  never overwritten** — it is pushed onto `routeHistory` with who changed it, why
-  and when, and the revision number goes up.
-- Distance is measured **on the server** from the points, never taken from the
-  client: the driver's fee and the fuel estimate are calculated from it, and a
-  wrong figure is not detectable later.
-- Every ping is checked against the planned line. Past the threshold, the trip is
-  flagged — **once, and the flag stays raised**. The owner wants to know it
-  happened on Tuesday night, not only whether it is happening at this second.
-- On close, `summariseJourney` walks the stored track and banks the **actual**
-  distance, driving time and stops onto the trip.
-- `GET /api/v1/trips/:id/route` returns the plan, every superseded version, the
-  driven line, and `varianceKm` between planned and actual.
-
-No map provider is called from the server. Distance, deviation and remaining
-distance are business facts that decide a driver's fee and a customer's bill;
-they must not stop working, or start costing per request, because a routing API
-is down or unpaid. The frontend is free to draw a road-snapped line on top.
-
-Polylines are thinned (Ramer–Douglas–Peucker) before being sent for drawing —
-the corners survive, the motorway filler does not. Stored history is never
-thinned; `?full=true` returns every point.
-
----
-
-## Money
-
-**Profit is measured against the pre-GST subtotal, never the invoice total.**
-GST is collected on the government's behalf. A trip billed at ₹85,000 + 5% shows
-₹89,250 on the invoice, and an owner shown a profit computed from ₹89,250 is
-being told they made ₹4,250 they will have to hand over.
-
-### Estimate vs actual
-
-The estimate is **frozen when the trip starts**. An estimate that can still be
-edited afterwards is not a budget — it is a way of making every trip look like it
-came in on target, and it would make the whole planned-versus-actual report
-worthless.
-
-`GET /api/v1/trips/:id/variance` returns it line by line, with `direction`
-(`under` / `over` / `on`) so colour coding is consistent everywhere.
-
-### Approval
-
-Only `APPROVED` expenses reach the profit. A driver's unverified ₹2,000 fuel
-claim is real and is reported as `pendingCost`, but folding it into the margin
-before anyone has seen the receipt is how a trip shows one profit today and
-another tomorrow.
-
-- Entries from a driver, or from anyone without `expenses.approve`, land
-  `PENDING`.
-- **Nobody approves their own claim.** Without that the workflow is decoration.
-- Closing a trip with pending expenses is refused, with an audited override.
-- Editing an approved amount drops it back into the queue.
-
-The ledger recomputes the whole trip after every change rather than adjusting a
-cached total by a delta — a delta applied twice, or missed because a request
-failed halfway, leaves a number that is wrong for ever with nothing to detect it.
-
----
-
-## API surface
-
-All under `/api/v1`. Bearer token in `Authorization`.
-
-**Auth** — `POST /auth/register` (company + owner), `/auth/login` (12 h token),
-`/auth/driver-login` (90 d token, `aud: driver-app`), `GET /auth/me`,
-`POST /auth/change-password`
-
-**Users** — `GET|POST /users`, `PUT|DELETE /users/:id`, `GET /users/permissions`
-
-**Company** — `GET|PUT /company`, `GET|PUT /company/tracking`,
-`PUT /company/defaults`, `PUT /company/vehicles/:id/tracking`
-
-**Masters** — `/customers`, `/vehicles` (+ `/documents`,
-`/vehicles/documents/expiring`), `/drivers` (+ `/:id/payments`)
-
-**Trips** — `GET|POST /trips`, `GET|PUT /trips/:id`, `PUT /trips/:id/revenue`,
-`PUT /trips/:id/estimate`, `POST /trips/:id/status`, `GET|PUT /trips/:id/route`,
-`GET /trips/:id/timeline`, `GET /trips/:id/variance`,
-`POST /trips/:id/recalculate`
-
-**Expenses** — `GET|POST /expenses`, `PUT|DELETE /expenses/:id`,
-`POST /expenses/:id/approve|reject`, `GET /expenses/pending`
-
-**Estimates** — `POST /estimates/calculate` (prices without saving — the one the
-owner uses with a customer on the phone), `GET|POST /estimates`,
-`GET|PUT /estimates/:id`, `POST /estimates/:id/send|accept|reject`.
-Accepting creates the trip, carrying the quote's cost lines across as the trip's
-budget and its price as the trip's revenue.
-
-**Tracking** — `GET /tracking/config`, `POST /tracking/pings` *(driver app)*,
-`POST /tracking/ping`, `GET /tracking/live`, `GET /tracking/live/:tripId`,
-`GET /tracking/history/:tripId`, `POST /tracking/history/:tripId/resummarise`,
-`GET /tracking/vehicle/:vehicleId`
-
-**Money & reporting** — `GET|POST /payments`, `GET /dashboard`,
-`GET /reports/profit|expenses|vehicles|drivers|customers|routes|variance|receivables`
-
-Reports count **closed trips only** — a trip still on the road has half its fuel
-bills unentered, and including it would make last month's margin change every
-time a driver adds a toll.
-
-### Error shape
-
-```json
-{ "error": { "code": "TRIP_NOT_FOUND", "message": "That trip no longer exists.", "details": null } }
-```
-
-`code` is stable and machine-readable; `message` is shown to the user; `details`
-carries a field-level map for validation errors. Some codes add context —
-`BAD_TRANSITION` carries `allowed`, so the UI can grey out the wrong buttons
-instead of letting the driver find out by tapping.
-
----
-
-## Trip lifecycle
-
-```
-DRAFT → PLANNED → ASSIGNED → READY → IN_TRANSIT → ARRIVED → DELIVERED → COMPLETED
-                                  exceptions: ON_HOLD · DELAYED · CANCELLED
-```
-
-Forward one step, and backward one step **only while the trip is still in the
-yard**. Once a lorry is `IN_TRANSIT` there is no reversing: un-starting a trip
-that has collected fuel bills and GPS points would leave a track and a ledger
-attached to a trip claiming never to have left. A trip started by mistake is
-`CANCELLED`, which is honest and keeps the evidence.
-
-`ASSIGNED` and `IN_TRANSIT` mark the lorry and driver busy. `COMPLETED`
-summarises the journey, recounts the ledger, then banks distance, revenue, cost
-and driver fees onto the vehicle and driver — **in that order**, because
-releasing first would add zero kilometres to the fleet totals, permanently.
-
-`ON_HOLD` / `DELAYED` remember where the trip was; `RESUME` puts it back.
-
----
-
-## Data model
-
-| Collection | Notes |
-|---|---|
-| `companies` | the tenant: settings, tracking config, standing rates, plan |
-| `accounts` | logins; `permissions[]` is the authority, `role` is a label |
-| `customers` `drivers` `vehicles` | masters, archived rather than deleted |
-| `trips` | the spine, with cached `actuals`, `journey` and `lastPosition` |
-| `tripexpenses` | own collection: highest-written, queried across trips |
-| `locationpings` | highest-volume by two orders of magnitude; two indexes |
-| `vehiclestates` | **one row per lorry**, upserted — what the live map reads |
-| `estimates` | quotes, so pricing can be compared against outturn |
-| `payments` | both directions, one `kind` discriminator |
-| `auditlogs` | only actions somebody may have to answer for |
-| `counters` | atomic `$inc` per company — `count()+1` gives two trips one number |
-
-### Three deliberate denormalisations
-
-- **`trip.lastPosition`** — the live map reads it instead of sorting the newest
-  ping per trip out of the largest collection in the system on every refresh.
-- **`vehiclestates`** — one row per lorry, so the fleet map is a single indexed
-  find, and so a lorry parked at the yard with no open trip still has a position.
-- **`vehicle.totals` / `driver.totals`** — advanced once at close, so the
-  profitability tables do not aggregate every trip ever run on each page load.
-
-Names (customer, plate, driver) are snapshotted onto trips and expenses: a trip
-closed in 2026 must still print what it ran with after the driver leaves.
-
----
-
-## Known limits
-
-Stated plainly rather than left to be discovered:
-
-- **No token revocation.** Changing a password issues a new token; the old one
-  stays valid until it expires.
-- **Rate limiting is in-process.** Behind more than one instance the effective
-  limit multiplies by the instance count. Enough to stop a runaway handset and
-  slow a password guesser; replace with Redis when it is not.
-- **No file storage.** `receiptUrl` and `fileUrl` take a URL; uploading is the
-  caller's problem for now.
-- **No mail or SMS.** `POST /estimates/:id/send` marks a quote as given to the
-  customer and starts the clock; it does not deliver it.
-- **No billing.** Plan limits are enforced; nothing is charged.
-- **Reports aggregate live** rather than from a rollup, which is why the window
-  is capped at two years.
+Skipping it restarts every sequence at 1 — the next trip would be `TRP-000001`,
+a number already on a customer's invoice.
+
+Transport sessions and driver handsets are unaffected: the token issuer is
+unchanged, accounts without a `module` default to `transport`, and tokens minted
+before `tokenVersion` existed are accepted until they expire.
+
+**The clinic slot collection changed shape completely in v4** — a slot now
+carries its bookings, its snapshots and an `expiresAt`, and the `appointments`
+collection is gone. There is no migration, because there is nothing worth
+migrating: slots are working memory with a two-day lifetime, so the correct
+upgrade is to drop `slots` and `appointments` and let each clinic publish its
+calendar again.
+
+Clinic sessions from v2 also end once, because the clinic tenant claim moved
+from the branch to the practice.

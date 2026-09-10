@@ -1,186 +1,94 @@
 /*
- * Who may see and do what inside one transport company.
+ * The permission dispatcher.
  *
- * The brief described four fixed roles — owner, manager, accountant,
- * operations. They are modelled here as PRESETS rather than as hard-coded
- * behaviour, and what is actually stored on a user is a list of permissions.
- * The reason is that no two transport offices divide the work the same way:
- * one owner wants the accountant to see the live map, the next does not want
- * the manager anywhere near driver fees. With presets, that is a tick box.
- * With hard-coded roles, it is a release.
+ * ================= why this file exists =================
  *
- * A role therefore only decides what the tick boxes START as. After the account
- * exists, the permission list is the truth and the role is a label.
+ * This backend serves two products from one deployment: MyTransport, which
+ * runs a haulage office, and MyClinic, which runs a group of clinics. They
+ * share an account table, an error envelope and a session; they share almost
+ * nothing about what a user is allowed to do. "expenses.approve" means a fuel
+ * bill in one and a laboratory invoice in the other, and half the permissions
+ * in each catalogue are meaningless in the other.
+ *
+ * The wrong fix is one merged catalogue: it would offer a clinic owner a tick
+ * box for "tracking.manage" and a transport owner one for "testresults.enter",
+ * and every screen listing permissions would have to filter by module anyway.
+ *
+ * So each module owns its own catalogue — modules/transport/permissions.js and
+ * modules/clinic/permissions.js — and this file picks between them using
+ * `account.module`. Nothing outside a module needs to know which catalogue it
+ * is looking at, which is what lets middleware/auth.js hold ONE permission
+ * check for the whole backend.
  */
+
+const transport = require("../modules/transport/permissions");
+const clinic = require("../modules/clinic/permissions");
+
+/* The two products. Also the enum on Account.module and the choice a signup
+ * form has to make before it can ask anything else. */
+const MODULES = ["transport", "clinic"];
+const DEFAULT_MODULE = "transport";
+
+const CATALOGUES = { transport, clinic };
 
 /*
- * Read and write are separate permissions throughout. An operations clerk who
- * may open a trip and log a toll must not be able to change what the customer
- * is being charged, and that distinction disappears the moment one "trips"
- * permission covers both.
+ * A module label a person will read. Kept here rather than in the frontend so
+ * the registration screen's module picker is served, the same way the
+ * permission catalogue is — one place to add the third product.
  */
-const PERMISSIONS = [
-  "dashboard.view",
-
-  "trips.view",
-  "trips.manage",
-  /* Starting and closing a trip is separated from editing one: closing banks
-   * the profit figure and freezes the ledger. */
-  "trips.close",
-
-  "vehicles.view",
-  "vehicles.manage",
-
-  "drivers.view",
-  "drivers.manage",
-  "drivers.payments",
-
-  "customers.view",
-  "customers.manage",
-
-  "estimates.view",
-  "estimates.manage",
-
-  "expenses.view",
-  "expenses.manage",
-  /* The audit gate. Approving somebody else's fuel bill is what moves it into
-   * the trip cost, so it is never bundled with being able to add one. */
-  "expenses.approve",
-
-  "revenue.view",
-  "revenue.manage",
-  "payments.manage",
-
-  /* Profit is split out from revenue on purpose: plenty of owners will show a
-   * manager what a trip earns without showing what the business keeps. */
-  "profit.view",
-  "reports.view",
-
-  "tracking.view",
-  /* Changing how often driver phones report — a company-wide setting with a
-   * data-cost consequence, so it is not part of merely watching the map. */
-  "tracking.manage",
-
-  "users.manage",
-  "settings.manage",
-];
-
-const PERMISSION_SET = new Set(PERMISSIONS);
-
-/* The label a user carries. "owner" is not in the presets below because an
- * owner is never checked against a list — see hasPermission. */
-const ROLES = ["owner", "manager", "accountant", "operations", "driver", "custom"];
-
-/*
- * The driver is the one role that is NOT a set of office permissions.
- *
- * Every other role is a desk in the same office looking at the same company:
- * more or less of it, but the same data. A driver is not that. A driver may see
- * exactly one thing — the trips they are on — and giving them `trips.view` would
- * grant the whole company's trip list, because that is what `trips.view` means
- * everywhere else in this codebase. Scoping it after the fact, endpoint by
- * endpoint, is how an authorisation bug eventually ships.
- *
- * So the driver's data lives behind its own router (routes/me.js) where every
- * query is bound to `req.account.driverId` by construction, and this preset is
- * deliberately EMPTY. A driver login holds no office permission at all: if the
- * driver module were deleted tomorrow, a driver's token would open nothing.
- *
- * `isDriverAccount` below is what the office endpoints use to keep a driver out
- * of them even if somebody later ticks a permission box by hand.
- */
-const DRIVER_ROLE = "driver";
-
-const ROLE_PRESETS = {
-  /* Everything, always. Listed for display only. */
-  owner: [...PERMISSIONS],
-
-  /* Runs the yard: trips, lorries, drivers, day-to-day spend, and the reports
-   * to argue about them. No user administration, no billing settings. */
-  manager: [
-    "dashboard.view",
-    "trips.view",
-    "trips.manage",
-    "trips.close",
-    "vehicles.view",
-    "vehicles.manage",
-    "drivers.view",
-    "drivers.manage",
-    "customers.view",
-    "customers.manage",
-    "estimates.view",
-    "estimates.manage",
-    "expenses.view",
-    "expenses.manage",
-    "revenue.view",
-    "profit.view",
-    "reports.view",
-    "tracking.view",
-  ],
-
-  /* The books. Sees every rupee and approves what the drivers spent; has no
-   * business assigning a lorry to a run. */
-  accountant: [
-    "dashboard.view",
-    "trips.view",
-    "customers.view",
-    "estimates.view",
-    "expenses.view",
-    "expenses.manage",
-    "expenses.approve",
-    "revenue.view",
-    "revenue.manage",
-    "payments.manage",
-    "drivers.view",
-    "drivers.payments",
-    "profit.view",
-    "reports.view",
-  ],
-
-  /* The desk that actually dispatches. Everything operational, nothing
-   * financial — deliberately no profit.view, so the person booking lorries
-   * cannot read the margin on the load. */
-  operations: [
-    "dashboard.view",
-    "trips.view",
-    "trips.manage",
-    "vehicles.view",
-    "drivers.view",
-    "customers.view",
-    "expenses.view",
-    "expenses.manage",
-    "tracking.view",
-  ],
-
-  /* See DRIVER_ROLE above: intentionally empty, and not a mistake. */
-  driver: [],
-
-  /* Starts empty. The owner ticks what this person needs. */
-  custom: ["dashboard.view"],
+const MODULE_LABELS = {
+  transport: "MyTransport — fleet, trips and profitability",
+  clinic: "MyClinic — clinics, appointments and diagnostics",
 };
 
-function presetFor(role) {
-  if (role === DRIVER_ROLE) return [];
-  return [...(ROLE_PRESETS[role] || ROLE_PRESETS.custom)];
+/*
+ * An unknown module resolves to transport rather than throwing.
+ *
+ * Accounts created before this backend served two products have no `module`
+ * field at all, and they are all transport accounts. Defaulting keeps every one
+ * of them signing in; throwing would turn a schema addition into an outage for
+ * the existing customer base.
+ */
+function moduleOf(accountOrModule) {
+  if (!accountOrModule) return DEFAULT_MODULE;
+  const value =
+    typeof accountOrModule === "string" ? accountOrModule : accountOrModule.module;
+  return MODULES.includes(value) ? value : DEFAULT_MODULE;
 }
 
-/*
- * A login that belongs to a person who drives rather than to a desk.
- *
- * Checked by identity — the link to a driver record — and not only by the role
- * label, so a driver account whose role was edited to "operations" still cannot
- * be handed the office. The two together are the gate; either alone is a gap.
- */
-function isDriverAccount(account) {
-  return !!account && (account.role === DRIVER_ROLE || !!account.driverId);
+function catalogueFor(accountOrModule) {
+  return CATALOGUES[moduleOf(accountOrModule)];
 }
+
+/* The full permission list for one module — what GET /users/permissions serves. */
+function permissionsFor(accountOrModule) {
+  return [...catalogueFor(accountOrModule).PERMISSIONS];
+}
+
+function rolesFor(accountOrModule) {
+  return [...catalogueFor(accountOrModule).ROLES];
+}
+
+function rolePresetsFor(accountOrModule) {
+  return catalogueFor(accountOrModule).ROLE_PRESETS;
+}
+
+/* What a role's tick boxes START as. After the account exists the stored list
+ * is the truth and the role is a label — in both modules. */
+function presetFor(module, role) {
+  return catalogueFor(module).presetFor(role);
+}
+
+/* Every role either module recognises, for the Account schema's enum. Owner
+ * appears in both, hence the Set. */
+const ALL_ROLES = [...new Set(MODULES.flatMap((m) => CATALOGUES[m].ROLES))];
 
 /*
  * The one authorisation question in the product.
  *
  * An owner short-circuits to true and is never matched against a stored list.
  * That is not a convenience: it means an owner cannot be locked out of their
- * own company by a bad edit to their own permissions, which is the single
+ * own business by a bad edit to their own permissions, which is the single
  * worst support call a system like this can generate.
  */
 function hasPermission(account, permission) {
@@ -191,43 +99,40 @@ function hasPermission(account, permission) {
 }
 
 /*
- * Validate a permission list coming off the wire. Unknown entries are dropped
- * rather than rejected: a slightly older admin screen posting a permission this
- * build has since renamed should still be able to save the rest of the form.
+ * Validate a permission list coming off the wire, against the catalogue of the
+ * account's OWN module. Unknown entries are dropped rather than rejected: a
+ * slightly older admin screen posting a permission this build has since renamed
+ * should still be able to save the rest of the form — and a clinic permission
+ * posted at a transport account is dropped for the same reason it should be,
+ * without needing its own error path.
  */
-function sanitisePermissions(raw, { allowEmpty = false } = {}) {
-  if (!Array.isArray(raw)) return [];
-  const clean = raw
-    .map((p) => String(p ?? "").trim())
-    .filter((p) => PERMISSION_SET.has(p));
-  /*
-   * Everyone needs somewhere to land after signing in — except a driver, whose
-   * landing page is their own trip list and who must not be given a company
-   * dashboard by a default. `allowEmpty` is how the users route says so.
-   */
-  if (!allowEmpty && !clean.includes("dashboard.view")) clean.unshift("dashboard.view");
-  return [...new Set(clean)];
+function sanitisePermissions(module, raw, options) {
+  return catalogueFor(module).sanitisePermissions(raw, options);
 }
 
 /*
- * What the frontend uses to build its menu. Sending the resolved list rather
- * than the role means the sidebar never has to know what "accountant" implies,
- * and a permission added here appears in the UI without a frontend release.
+ * What the frontend uses to build its menu. Sending the RESOLVED list rather
+ * than the role means the sidebar never has to know what "receptionist"
+ * implies, and a permission added on the server appears in the UI without a
+ * frontend release.
  */
 function effectivePermissions(account) {
   if (!account) return [];
-  if (account.role === "owner") return [...PERMISSIONS];
-  return [...(account.permissions || [])];
+  return catalogueFor(account).effectivePermissions(account);
 }
 
 module.exports = {
-  PERMISSIONS,
-  ROLES,
-  ROLE_PRESETS,
-  DRIVER_ROLE,
+  MODULES,
+  DEFAULT_MODULE,
+  MODULE_LABELS,
+  ALL_ROLES,
+  moduleOf,
+  catalogueFor,
+  permissionsFor,
+  rolesFor,
+  rolePresetsFor,
   presetFor,
   hasPermission,
-  isDriverAccount,
   sanitisePermissions,
   effectivePermissions,
 };

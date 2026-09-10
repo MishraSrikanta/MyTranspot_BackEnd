@@ -1,16 +1,25 @@
 {
-  "name": "mytransport-backend",
-  "version": "1.0.0",
+  "name": "mytransport-myclinic-backend",
+  "version": "2.0.0",
   "main": "server.js",
-  "description": "MyTransport — cloud transportation management and profitability API",
+  "description": "One backend, two modules — MyTransport (fleet & profitability) and MyClinic (offline-first clinic booking)",
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "seed": "node scripts/seed-demo.js",
-    "ensure-owner": "node scripts/ensure-owner.js",
-    "check-indexes": "node scripts/check-indexes.js"
+    "seed": "node modules/transport/scripts/seed-demo.js",
+    "ensure-owner": "node modules/transport/scripts/ensure-owner.js",
+    "check-indexes": "node scripts/check-indexes.js",
+    "migrate-counters": "node scripts/migrate-counters.js"
   },
-  "keywords": ["transport", "fleet", "tms", "tracking"],
+  "keywords": [
+    "transport",
+    "fleet",
+    "tms",
+    "tracking",
+    "clinic",
+    "appointments",
+    "booking"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
@@ -23,5 +32,8 @@
   },
   "devDependencies": {
     "nodemon": "^3.1.14"
+  },
+  "optionalDependencies": {
+    "@google-cloud/storage": "^7.14.0"
   }
 }

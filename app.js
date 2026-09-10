@@ -90,16 +90,20 @@ const app = express();
 /* ================= middleware ================= */
 
 /*
- * CORS is an allowlist read from the environment. The wildcard is available for
- * local development and is what CORS_ORIGINS defaults to, but a comma-separated
- * list is what should be deployed: this API is opened by browser apps carrying
- * a bearer token, and a permissive policy in production means any page on the
- * internet can drive a signed-in owner's session.
+ * CORS is an allowlist read from the environment plus the deployed admin
+ * frontend. The wildcard is available for local development and is what
+ * CORS_ORIGINS defaults to, but a comma-separated list is what should be
+ * deployed: this API is opened by browser apps carrying a bearer token, and a
+ * permissive policy in production means any page on the internet can drive a
+ * signed-in owner's session.
  */
-const allowedOrigins = String(process.env.CORS_ORIGINS || "*")
-  .split(",")
-  .map((o) => o.trim())
-  .filter(Boolean);
+const allowedOrigins = [
+  ...String(process.env.CORS_ORIGINS || "*")
+    .split(",")
+    .map((o) => o.trim())
+    .filter(Boolean),
+  "https://mystockioadmin.vercel.app",
+];
 
 app.use(
   cors({
